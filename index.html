@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Limit Order Book Simulator</title>
+<style>
+  :root{--bg:#0b0f14;--card:#141b24;--line:#223041;--txt:#e6edf3;--mut:#8b9bb0;--g:#2ecc71;--r:#ff5d5d;--b:#4da3ff}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:12px;max-width:760px;margin:auto}
+  h1{font-size:18px;margin:4px 0 2px}
+  .sub{color:var(--mut);font-size:12px;margin-bottom:10px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px;margin-bottom:10px}
+  .card h2{font-size:12px;color:var(--mut);margin:0 0 8px;text-transform:uppercase;letter-spacing:.06em}
+  .controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  button{background:var(--b);color:#fff;border:0;border-radius:8px;padding:10px 14px;font-size:14px;font-weight:600}
+  button.sec{background:#2a3647}
+  button:active{opacity:.8}
+  .slider{flex:1 1 100%;display:flex;align-items:center;gap:8px;font-size:12px;color:var(--mut)}
+  .slider input{flex:1}
+  .stats{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
+  @media(min-width:560px){.stats{grid-template-columns:repeat(4,1fr)}}
+  .stat{background:#0f151d;border:1px solid var(--line);border-radius:8px;padding:8px}
+  .stat .l{font-size:11px;color:var(--mut)}
+  .stat .v{font-size:17px;font-weight:700;font-family:ui-monospace,Menlo,Consolas,monospace;margin-top:2px}
+  .pos{color:var(--g)}.neg{color:var(--r)}
+  canvas{width:100%;height:150px;display:block}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  table{width:100%;border-collapse:collapse;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+  td,th{padding:3px 4px;text-align:right}
+  th{color:var(--mut);font-weight:500}
+  .ask td:first-child{color:var(--r)}.bid td:first-child{color:var(--g)}
+  .tb{color:var(--g)}.ts{color:var(--r)}
+  .bench{font-size:13px;line-height:1.6;font-family:ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap}
+  .note{font-size:11px;color:var(--mut);margin-top:6px}
+</style>
+</head>
+<body>
+<h1>Limit Order Book &amp; Matching Engine</h1>
+<div class="sub">Price-time priority matching, market-making bot, live latency stats. Runs fully in your browser.</div>
+
+<div class="card">
+  <div class="controls">
+    <button id="toggle">Start</button>
+    <button id="reset" class="sec">Reset</button>
+    <button id="bench" class="sec">Run Benchmark</button>
+    <div class="slider">Flow: <input id="rate" type="range" min="50" max="5000" step="50" value="500"> <span id="rateV">500</span> msg/s</div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Live stats</h2>
+  <div class="stats">
+    <div class="stat"><div class="l">Messages/sec</div><div class="v" id="ops">0</div></div>
+    <div class="stat"><div class="l">Avg latency</div><div class="v" id="lat">0</div></div>
+    <div class="stat"><div class="l">Spread ($)</div><div class="v" id="spread">–</div></div>
+    <div class="stat"><div class="l">Mid ($)</div><div class="v" id="mid">–</div></div>
+    <div class="stat"><div class="l">Trades</div><div class="v" id="trades">0</div></div>
+    <div class="stat"><div class="l">Volume</div><div class="v" id="vol">0</div></div>
+    <div class="stat"><div class="l">Bot PnL ($)</div><div class="v" id="pnl">0</div></div>
+    <div class="stat"><div class="l">Bot inventory</div><div class="v" id="inv">0</div></div>
+  </div>
+  <div class="note">Latency is batch-measured, so very small values are approximate. Use the benchmark for exact numbers.</div>
+</div>
+
+<div class="card"><h2>Market depth</h2><canvas id="depth"></canvas></div>
+
+<div class="two">
+  <div class="card"><h2>Order book (top 6)</h2>
+    <table><thead><tr><th>Price</th><th>Qty</th></tr></thead><tbody id="ladder"></tbody></table>
+  </div>
+  <div class="card"><h2>Recent trades</h2>
+    <table><thead><tr><th>Price</th><th>Qty</th></tr></thead><tbody id="tape"></tbody></table>
+  </div>
+</div>
+
+<div class="card"><h2>Market-maker bot PnL</h2><canvas id="pnlc"></canvas>
+  <div class="note">Bot quotes both sides around mid, skews quotes against its inventory, and caps position size.</div>
+</div>
+
+<div class="card"><h2>Benchmark</h2><div class="bench" id="benchOut">Tap "Run Benchmark" to push 200,000 messages through a fresh engine.</div></div>
+
+<script>
+'use strict';
+// ==== ENGINE START ====
+// Prices are integer ticks (1 tick = $0.01) to avoid floating point errors.
+class OrderBook {
+  constructor() {
+    this.bids = [];            // price levels, best (highest) first
+    this.asks = [];            // price levels, best (lowest) first
+    this.orders = new Map();   // id -> resting order
+    this.nextId = 1;
+    this.tradeCount = 0;
+    this.volume = 0;
+    this.lastPrice = null;
+    this.onTrade = null;
+  }
+  _search(levels, price, side) {
+    // binary search: first index whose level is not strictly better than `price`
+    let lo = 0, hi = levels.length;
+    while (lo < hi) {
+      const m = (lo + hi) >> 1;
+      const better = side === 'B' ? levels[m].price > price : levels[m].price < price;
+      if (better) lo = m + 1; else hi = m;
+    }
+    return lo;
+  }
+  best(side) {
+    const l = side === 'B' ? this.bids : this.asks;
+    return l.length ? l[0].price : null;
+  }
+  // type: 'L' = limit, 'M' = market (never rests)
+  add(side, price, qty, owner, type = 'L') {
+    const id = this.nextId++;
+    let remaining = qty;
+    const opp = side === 'B' ? this.asks : this.bids;
+    while (remaining > 0 && opp.length) {
+      const lvl = opp[0];
+      if (type === 'L') {
+        if (side === 'B' ? lvl.price > price : lvl.price < price) break;
+      }
+      const q = lvl.orders;
+      while (remaining > 0 && q.length) {
+        const maker = q[0];                       // oldest order first = time priority
+        const fill = Math.min(remaining, maker.qty);
+        maker.qty -= fill; remaining -= fill; lvl.qty -= fill;
+        this.tradeCount++; this.volume += fill; this.lastPrice = lvl.price;
+        if (this.onTrade) this.onTrade({ price: lvl.price, qty: fill, takerSide: side, taker: owner, maker: maker.owner });
+        if (maker.qty === 0) { q.shift(); this.orders.delete(maker.id); }
+      }
+      if (q.length === 0) opp.shift();
+    }
+    if (remaining > 0 && type === 'L') {
+      const levels = side === 'B' ? this.bids : this.asks;
+      const i = this._search(levels, price, side);
+      let lvl;
+      if (i < levels.length && levels[i].price === price) lvl = levels[i];
+      else { lvl = { price, qty: 0, orders: [] }; levels.splice(i, 0, lvl); }
+      const o = { id, side, price, qty: remaining, owner };
+      lvl.orders.push(o); lvl.qty += remaining;
+      this.orders.set(id, o);
+    }
+    return id;
+  }
+  cancel(id) {
+    const o = this.orders.get(id);
+    if (!o) return false;
+    const levels = o.side === 'B' ? this.bids : this.asks;
+    const i = this._search(levels, o.price, o.side);
+    const lvl = levels[i];
+    const j = lvl.orders.indexOf(o);
+    lvl.orders.splice(j, 1);
+    lvl.qty -= o.qty;
+    if (lvl.orders.length === 0) levels.splice(i, 1);
+    this.orders.delete(id);
+    return true;
+  }
+}
+
+// Random order flow: random-walk fair price, limits near fair, some market orders, some cancels.
+class Flow {
+  constructor(book) { this.book = book; this.fair = 10000; this.live = []; }
+  step() {
+    const b = this.book;
+    if (Math.random() < 0.1) this.fair += Math.random() < 0.5 ? -1 : 1;
+    const r = Math.random();
+    if (r < 0.3 && this.live.length) {
+      const k = (Math.random() * this.live.length) | 0;
+      const id = this.live[k];
+      this.live[k] = this.live[this.live.length - 1];
+      this.live.pop();
+      b.cancel(id);
+      return;
+    }
+    const side = Math.random() < 0.5 ? 'B' : 'S';
+    const qty = 1 + ((Math.random() * 20) | 0);
+    if (r < 0.42) { b.add(side, 0, qty, 'MKT', 'M'); return; }
+    const off = (-Math.log(1 - Math.random()) * 3) | 0;
+    const price = side === 'B' ? this.fair - off - 1 : this.fair + off + 1;
+    const id = b.add(side, price, qty, 'FLOW');
+    if (b.orders.has(id)) this.live.push(id);
+  }
+}
+
+// Simple inventory-aware market maker.
+class MarketMaker {
+  constructor(book) {
+    this.book = book; this.cash = 0; this.inv = 0; this.ids = [];
+    this.halfSpread = 2; this.size = 10; this.skew = 0.05; this.maxInv = 200;
+  }
+  onTrade(t) {
+    let side = null;
+    if (t.taker === 'MM') side = t.takerSide;
+    else if (t.maker === 'MM') side = t.takerSide === 'B' ? 'S' : 'B';
+    if (!side) return;
+    if (side === 'B') { this.inv += t.qty; this.cash -= t.qty * t.price; }
+    else { this.inv -= t.qty; this.cash += t.qty * t.price; }
+  }
+  requote(mid) {
+    for (const id of this.ids) this.book.cancel(id);
+    this.ids = [];
+    const shift = Math.round(this.inv * this.skew);   // long -> quote lower to sell, short -> quote higher to buy
+    const m = Math.round(mid);
+    const bid = m - this.halfSpread - shift;
+    let ask = m + this.halfSpread - shift;
+    if (ask <= bid) ask = bid + 1;
+    if (this.inv < this.maxInv) this.ids.push(this.book.add('B', bid, this.size, 'MM'));
+    if (this.inv > -this.maxInv) this.ids.push(this.book.add('S', ask, this.size, 'MM'));
+  }
+  pnl(mid) { return (this.cash + this.inv * mid) / 100; }
+}
+// ==== ENGINE END ====
+
+// ---------- UI ----------
+const $ = id => document.getElementById(id);
+let book, flow, mm, running = false, rate = 500;
+let trades = [], pnlHist = [], acc = 0, lastT = 0, lastRender = 0, stepN = 0;
+let winStart = 0, winCount = 0, opsPerSec = 0;
+let latTime = 0, latCount = 0, latUs = 0, latWin = 0;
+
+function mid() {
+  const b = book.best('B'), a = book.best('S');
+  if (b != null && a != null) return (b + a) / 2;
+  return book.lastPrice != null ? book.lastPrice : flow.fair;
+}
+
+function init() {
+  book = new OrderBook(); flow = new Flow(book); mm = new MarketMaker(book);
+  trades = []; pnlHist = []; acc = 0; stepN = 0; opsPerSec = 0; latUs = 0;
+  book.onTrade = t => { mm.onTrade(t); trades.push(t); if (trades.length > 8) trades.shift(); };
+  for (let i = 0; i < 500; i++) flow.step();
+  mm.requote(mid());
+  render();
+}
+
+function frame(ts) {
+  if (!running) return;
+  const dt = Math.min(ts - lastT, 100); lastT = ts;
+  acc += rate * dt / 1000;
+  let n = Math.floor(acc); acc -= n; n = Math.min(n, 5000);
+  if (n > 0) {
+    const t0 = performance.now();
+    for (let i = 0; i < n; i++) {
+      flow.step(); stepN++;
+      if (stepN % 10 === 0) { mm.requote(mid()); winCount += 2; }
+    }
+    latTime += performance.now() - t0; latCount += n; winCount += n;
+  }
+  if (ts - winStart >= 1000) { opsPerSec = winCount * 1000 / (ts - winStart); winCount = 0; winStart = ts; }
+  if (ts - latWin >= 2000 && latCount > 0) { latUs = latTime * 1000 / latCount; latTime = 0; latCount = 0; latWin = ts; }
+  if (ts - lastRender > 200) { render(); lastRender = ts; }
+  requestAnimationFrame(frame);
+}
+
+const fmt = p => (p / 100).toFixed(2);
+
+function render() {
+  const b = book.best('B'), a = book.best('S');
+  $('ops').textContent = Math.round(opsPerSec).toLocaleString();
+  $('lat').textContent = latUs.toFixed(1) + ' µs';
+  $('spread').textContent = (b != null && a != null) ? fmt(a - b) : '–';
+  $('mid').textContent = fmt(mid());
+  $('trades').textContent = book.tradeCount.toLocaleString();
+  $('vol').textContent = book.volume.toLocaleString();
+  const p = mm.pnl(mid());
+  const pe = $('pnl');
+  pe.textContent = (p >= 0 ? '+' : '') + p.toFixed(2);
+  pe.className = 'v ' + (p >= 0 ? 'pos' : 'neg');
+  $('inv').textContent = mm.inv;
+  if (running) { pnlHist.push(p); if (pnlHist.length > 300) pnlHist.shift(); }
+
+  let html = '';
+  const asks = book.asks.slice(0, 6).reverse();
+  for (const l of asks) html += `<tr class="ask"><td>${fmt(l.price)}</td><td>${l.qty}</td></tr>`;
+  html += `<tr><td colspan="2" style="text-align:center;color:#8b9bb0">— spread —</td></tr>`;
+  for (const l of book.bids.slice(0, 6)) html += `<tr class="bid"><td>${fmt(l.price)}</td><td>${l.qty}</td></tr>`;
+  $('ladder').innerHTML = html;
+
+  $('tape').innerHTML = trades.slice().reverse()
+    .map(t => `<tr class="${t.takerSide === 'B' ? 'tb' : 'ts'}"><td>${fmt(t.price)}</td><td>${t.qty}</td></tr>`).join('');
+
+  drawDepth(); drawPnl();
+}
+
+function setupCanvas(c) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = c.clientWidth, h = c.clientHeight;
+  if (c.width !== w * dpr || c.height !== h * dpr) { c.width = w * dpr; c.height = h * dpr; }
+  const ctx = c.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  return { ctx, w, h };
+}
+
+function drawDepth() {
+  const { ctx, w, h } = setupCanvas($('depth'));
+  const bids = book.bids.slice(0, 25), asks = book.asks.slice(0, 25);
+  if (!bids.length || !asks.length) return;
+  const pMin = bids[bids.length - 1].price, pMax = asks[asks.length - 1].price;
+  const bc = [], ac = [];
+  let c = 0; for (const l of bids) { c += l.qty; bc.push(c); }
+  c = 0; for (const l of asks) { c += l.qty; ac.push(c); }
+  const maxC = Math.max(bc[bc.length - 1], ac[ac.length - 1]);
+  const X = p => (p - pMin) / Math.max(1, pMax - pMin) * w;
+  const Y = q => h - 4 - q / maxC * (h - 12);
+  function area(levels, cum, color) {
+    ctx.beginPath();
+    ctx.moveTo(X(levels[0].price), h);
+    ctx.lineTo(X(levels[0].price), Y(cum[0]));
+    for (let i = 1; i < levels.length; i++) {
+      ctx.lineTo(X(levels[i].price), Y(cum[i - 1]));
+      ctx.lineTo(X(levels[i].price), Y(cum[i]));
+    }
+    ctx.lineTo(X(levels[levels.length - 1].price), h);
+    ctx.closePath();
+    ctx.fillStyle = color + '55'; ctx.fill();
+    ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.stroke();
+  }
+  area(bids, bc, '#2ecc71');
+  area(asks, ac, '#ff5d5d');
+}
+
+function drawPnl() {
+  const { ctx, w, h } = setupCanvas($('pnlc'));
+  if (pnlHist.length < 2) return;
+  let lo = Math.min(0, ...pnlHist), hi = Math.max(0, ...pnlHist);
+  if (hi - lo < 1e-6) hi = lo + 1;
+  const X = i => i / (pnlHist.length - 1) * w;
+  const Y = v => h - 6 - (v - lo) / (hi - lo) * (h - 12);
+  ctx.strokeStyle = '#223041'; ctx.beginPath(); ctx.moveTo(0, Y(0)); ctx.lineTo(w, Y(0)); ctx.stroke();
+  ctx.strokeStyle = '#4da3ff'; ctx.lineWidth = 2; ctx.beginPath();
+  pnlHist.forEach((v, i) => i ? ctx.lineTo(X(i), Y(v)) : ctx.moveTo(X(i), Y(v)));
+  ctx.stroke();
+}
+
+function runBenchmark() {
+  const out = $('benchOut');
+  out.textContent = 'Running 200,000 messages...';
+  setTimeout(() => {
+    const N = 200000;
+    const b = new OrderBook(), f = new Flow(b);
+    let tr = 0; b.onTrade = () => { tr++; };
+    for (let i = 0; i < 5000; i++) f.step();       // warm-up for the JIT
+    tr = 0;
+    const t0 = performance.now();
+    for (let i = 0; i < N; i++) f.step();
+    const ms = performance.now() - t0;
+    out.textContent =
+      `Messages:      ${N.toLocaleString()} (orders + cancels)\n` +
+      `Time:          ${ms.toFixed(0)} ms\n` +
+      `Throughput:    ${Math.round(N / ms * 1000).toLocaleString()} msg/s\n` +
+      `Avg latency:   ${(ms * 1000 / N).toFixed(2)} µs/msg\n` +
+      `Trades:        ${tr.toLocaleString()}\n` +
+      `Resting orders:${b.orders.size.toLocaleString()}`;
+  }, 50);
+}
+
+$('toggle').onclick = () => {
+  running = !running;
+  $('toggle').textContent = running ? 'Pause' : 'Start';
+  if (running) { lastT = winStart = latWin = performance.now(); requestAnimationFrame(frame); }
+};
+$('reset').onclick = () => init();
+$('bench').onclick = runBenchmark;
+$('rate').oninput = e => { rate = +e.target.value; $('rateV').textContent = rate; };
+window.addEventListener('resize', () => render());
+init();
+</script>
+</body>
+</html>
